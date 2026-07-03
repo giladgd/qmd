@@ -15,6 +15,7 @@ import {
   LlamaChatSession,
   LlamaLogLevel
 } from "node-llama-cpp";
+import { withLock } from "lifecycle-utils";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -671,6 +672,7 @@ function isCpuModeRequested(): boolean {
 
 export class LlamaCpp implements LLM {
   private readonly _ciMode = !!process.env.CI;
+  private readonly lockScope = {};
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
   private embedContexts: LlamaEmbeddingContext[] = [];
@@ -683,16 +685,6 @@ export class LlamaCpp implements LLM {
   private rerankModelUri: string;
   private modelCacheDir: string;
   private expandContextSize: number;
-
-  // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
-  private embedModelLoadPromise: Promise<LlamaModel> | null = null;
-  private generateModelLoadPromise: Promise<LlamaModel> | null = null;
-  private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
-  // Guard against concurrent ensureLlama() calls creating duplicate Llama
-  // instances. Without this, two concurrent callers each build their own
-  // runtime and the last write to this.llama wins, leaving models/grammars
-  // bound to different Llama instances ("different Llama instance" errors).
-  private llamaLoadPromise: Promise<Llama> | null = null;
 
   // Inactivity timer for auto-unloading models
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
@@ -805,10 +797,6 @@ export class LlamaCpp implements LLM {
         await this.rerankModel.dispose();
         this.rerankModel = null;
       }
-      // Reset load promises so models can be reloaded later
-      this.embedModelLoadPromise = null;
-      this.generateModelLoadPromise = null;
-      this.rerankModelLoadPromise = null;
     }
 
     // Note: We keep llama instance alive - it's lightweight
@@ -830,15 +818,12 @@ export class LlamaCpp implements LLM {
     if (this.llama) {
       return this.llama;
     }
-    if (this.llamaLoadPromise) {
-      return await this.llamaLoadPromise;
-    }
-    this.llamaLoadPromise = this.loadLlamaRuntime(allowBuild);
-    try {
-      return await this.llamaLoadPromise;
-    } finally {
-      this.llamaLoadPromise = null;
-    }
+    return await withLock([this.lockScope, "llama"] as const, async () => {
+      if (this.llama) {
+        return this.llama;
+      }
+      return await this.loadLlamaRuntime(allowBuild);
+    });
   }
 
   private async loadLlamaRuntime(allowBuild = true): Promise<Llama> {
@@ -964,11 +949,12 @@ export class LlamaCpp implements LLM {
     if (this.embedModel) {
       return this.embedModel;
     }
-    if (this.embedModelLoadPromise) {
-      return await this.embedModelLoadPromise;
-    }
 
-    this.embedModelLoadPromise = (async () => {
+    return await withLock([this.lockScope, "embedModel"] as const, async () => {
+      if (this.embedModel) {
+        return this.embedModel;
+      }
+
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.embedModelUri);
       const model = await llama.loadModel(this.modelLoadOptions(modelPath));
@@ -976,14 +962,7 @@ export class LlamaCpp implements LLM {
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
       return model;
-    })();
-
-    try {
-      return await this.embedModelLoadPromise;
-    } finally {
-      // Keep the resolved model cached; clear only the in-flight promise.
-      this.embedModelLoadPromise = null;
-    }
+    });
   }
 
   /**
@@ -1027,23 +1006,18 @@ export class LlamaCpp implements LLM {
     return Math.max(1, Math.floor(cores / parallelism));
   }
 
-  /**
-   * Load embedding contexts (lazy). Creates multiple for parallel embedding.
-   * Uses promise guard to prevent concurrent context creation race condition.
-   */
-  private embedContextsCreatePromise: Promise<LlamaEmbeddingContext[]> | null = null;
-
   private async ensureEmbedContexts(): Promise<LlamaEmbeddingContext[]> {
     if (this.embedContexts.length > 0) {
       this.touchActivity();
       return this.embedContexts;
     }
 
-    if (this.embedContextsCreatePromise) {
-      return await this.embedContextsCreatePromise;
-    }
+    return await withLock([this.lockScope, "embedContexts"] as const, async () => {
+      if (this.embedContexts.length > 0) {
+        this.touchActivity();
+        return this.embedContexts;
+      }
 
-    this.embedContextsCreatePromise = (async () => {
       const model = await this.ensureEmbedModel();
       // Embed contexts are ~143 MB each (nomic-embed 2048 ctx)
       const n = await this.computeParallelism(150);
@@ -1061,13 +1035,7 @@ export class LlamaCpp implements LLM {
       }
       this.touchActivity();
       return this.embedContexts;
-    })();
-
-    try {
-      return await this.embedContextsCreatePromise;
-    } finally {
-      this.embedContextsCreatePromise = null;
-    }
+    });
   }
 
   /**
@@ -1082,30 +1050,25 @@ export class LlamaCpp implements LLM {
    * Load generation model (lazy) - context is created fresh per call
    */
   private async ensureGenerateModel(): Promise<LlamaModel> {
-    if (!this.generateModel) {
-      if (this.generateModelLoadPromise) {
-        return await this.generateModelLoadPromise;
+    if (this.generateModel) {
+      this.touchActivity();
+      return this.generateModel;
+    }
+
+    const model = await withLock([this.lockScope, "generateModel"] as const, async () => {
+      if (this.generateModel) {
+        return this.generateModel;
       }
 
-      this.generateModelLoadPromise = (async () => {
         const llama = await this.ensureLlama();
         const modelPath = await this.resolveModel(this.generateModelUri);
         const model = await llama.loadModel(this.modelLoadOptions(modelPath));
         this.generateModel = model;
         return model;
-      })();
+    });
 
-      try {
-        await this.generateModelLoadPromise;
-      } finally {
-        this.generateModelLoadPromise = null;
-      }
-    }
     this.touchActivity();
-    if (!this.generateModel) {
-      throw new Error("Generate model not loaded");
-    }
-    return this.generateModel;
+    return model;
   }
 
   /**
@@ -1115,11 +1078,12 @@ export class LlamaCpp implements LLM {
     if (this.rerankModel) {
       return this.rerankModel;
     }
-    if (this.rerankModelLoadPromise) {
-      return await this.rerankModelLoadPromise;
-    }
 
-    this.rerankModelLoadPromise = (async () => {
+    return await withLock([this.lockScope, "rerankModel"] as const, async () => {
+      if (this.rerankModel) {
+        return this.rerankModel;
+      }
+
       const llama = await this.ensureLlama();
       const modelPath = await this.resolveModel(this.rerankModelUri);
       const model = await llama.loadModel(this.modelLoadOptions(modelPath));
@@ -1127,13 +1091,7 @@ export class LlamaCpp implements LLM {
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
       return model;
-    })();
-
-    try {
-      return await this.rerankModelLoadPromise;
-    } finally {
-      this.rerankModelLoadPromise = null;
-    }
+    });
   }
 
   /**
@@ -1162,7 +1120,17 @@ export class LlamaCpp implements LLM {
     return Number.isFinite(v) && v > 0 ? v : 2048;
   })();
   private async ensureRerankContexts(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>[]> {
-    if (this.rerankContexts.length === 0) {
+    if (this.rerankContexts.length > 0) {
+      this.touchActivity();
+      return this.rerankContexts;
+    }
+
+    return await withLock([this.lockScope, "rerankContexts"] as const, async () => {
+      if (this.rerankContexts.length > 0) {
+        this.touchActivity();
+        return this.rerankContexts;
+      }
+
       const model = await this.ensureRerankModel();
       // ~960 MB per context with flash attention at contextSize 2048
       const n = Math.min(await this.computeParallelism(1000), 4);
@@ -1188,9 +1156,9 @@ export class LlamaCpp implements LLM {
           break;
         }
       }
-    }
-    this.touchActivity();
-    return this.rerankContexts;
+      this.touchActivity();
+      return this.rerankContexts;
+    });
   }
 
   // ==========================================================================
@@ -1687,12 +1655,6 @@ export class LlamaCpp implements LLM {
       this.llama = null;
     }
 
-    // Clear any in-flight load/create promises
-    this.embedModelLoadPromise = null;
-    this.embedContextsCreatePromise = null;
-    this.generateModelLoadPromise = null;
-    this.rerankModelLoadPromise = null;
-    this.llamaLoadPromise = null;
   }
 }
 
