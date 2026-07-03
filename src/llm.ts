@@ -4,40 +4,20 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
-import type {
-  Llama,
-  LlamaModel,
-  LlamaEmbeddingContext,
-  Token as LlamaToken,
+import {
+  type Llama,
+  type LlamaModel,
+  type LlamaEmbeddingContext,
+  type Token as LlamaToken,
+  getLlama,
+  getLlamaGpuTypes,
+  resolveModelFile,
+  LlamaChatSession,
+  LlamaLogLevel
 } from "node-llama-cpp";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
-
-type NodeLlamaCppModule = {
-  getLlama: (options: Record<string, unknown>) => Promise<Llama>;
-  getLlamaGpuTypes?: (include?: "supported" | "allValid") => Promise<LlamaGpuMode[]>;
-  resolveModelFile: (model: string, cacheDir: string) => Promise<string>;
-  LlamaChatSession: new (options: { contextSequence: unknown }) => {
-    prompt: (prompt: string, options?: Record<string, unknown>) => Promise<string>;
-  };
-  LlamaLogLevel: { error: unknown };
-};
-
-let nodeLlamaCppImport: Promise<NodeLlamaCppModule> | null = null;
-async function loadNodeLlamaCpp(): Promise<NodeLlamaCppModule> {
-  nodeLlamaCppImport ??= withNativeStdoutRedirectedToStderr(
-    () => import("node-llama-cpp") as Promise<NodeLlamaCppModule>
-  );
-  return nodeLlamaCppImport;
-}
-
-export function setNodeLlamaCppModuleForTest(module: NodeLlamaCppModule | null): void {
-  nodeLlamaCppImport = module ? Promise.resolve(module) : null;
-  failedGpuInitModes.clear();
-  noGpuAccelerationWarningShown = false;
-  cpuForcedPrebuiltFallbackWarningShown = false;
-}
 
 type StdoutWrite = typeof process.stdout.write;
 let nativeStdoutRedirectDepth = 0;
@@ -495,7 +475,6 @@ export async function pullModels(
       }
     }
 
-    const { resolveModelFile } = await loadNodeLlamaCpp();
     const path = await resolveModelFile(model, cacheDir);
     validateGgufFile(path, model);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
@@ -725,12 +704,6 @@ export class LlamaCpp implements LLM {
 
 
   constructor(config: LlamaCppConfig = {}) {
-    // STRUCTURAL INVARIANT: the launcher (bin/qmd) sets GGML_METAL_NO_RESIDENCY=1
-    // on darwin BEFORE the native binding loads, which prevents the libggml-metal
-    // static destructor assertion at process exit (ggml-org/llama.cpp#22593).
-    // See isDarwinMetalMitigationActive() for the runtime check exposed to
-    // diagnostics. No constructor-time guard installation is needed.
-
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
@@ -872,7 +845,6 @@ export class LlamaCpp implements LLM {
     if (!this.llama) {
       const gpuMode = resolveLlamaGpuMode();
 
-      const { getLlama, getLlamaGpuTypes, LlamaLogLevel } = await loadNodeLlamaCpp();
       const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = allowBuild, buildOverride?: "auto" | "never") =>
         await withNativeStdoutRedirectedToStderr(() => getLlama({
           // Prefer packaged prebuilt bindings before compiling llama.cpp locally.
@@ -921,9 +893,8 @@ export class LlamaCpp implements LLM {
           // documented auto mode for Metal/CUDA/Vulkan while recovering on
           // systems where a packaged backend can load but detection is too
           // conservative. Never compile during these extra probes.
-          if (gpuMode === "auto" && llama.gpu === false && getLlamaGpuTypes) {
-            const candidates = (await getLlamaGpuTypes("allValid"))
-              .filter((candidate): candidate is Exclude<LlamaGpuMode, "auto" | false> => candidate !== false && candidate !== "auto");
+          if (gpuMode === "auto" && llama.gpu === false) {
+            const candidates = (await getLlamaGpuTypes("allValid")).filter((candidate) => candidate !== false);
             for (const candidate of candidates) {
               if (failedGpuInitModes.has(candidate)) continue;
               try {
@@ -981,7 +952,6 @@ export class LlamaCpp implements LLM {
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
-    const { resolveModelFile } = await loadNodeLlamaCpp();
     const modelPath = await resolveModelFile(modelUri, this.modelCacheDir);
     validateGgufFile(modelPath, modelUri);
     return modelPath;
@@ -1401,7 +1371,6 @@ export class LlamaCpp implements LLM {
     // Create fresh context -> sequence -> session for each call
     const context = await this.generateModel!.createContext();
     const sequence = context.getSequence();
-    const { LlamaChatSession } = await loadNodeLlamaCpp();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     const maxTokens = options.maxTokens ?? 150;
@@ -1486,7 +1455,6 @@ export class LlamaCpp implements LLM {
         contextSize: this.expandContextSize,
       });
       const sequence = genContext.getSequence();
-      const { LlamaChatSession } = await loadNodeLlamaCpp();
       const session = new LlamaChatSession({ contextSequence: sequence });
 
       // Qwen3 recommended settings for non-thinking mode:
@@ -1690,9 +1658,7 @@ export class LlamaCpp implements LLM {
     }
 
     // Explicitly dispose in dependency order: contexts first, then models, then llama.
-    // Relying only on llama.dispose() leaves Metal resource sets alive until process
-    // finalization on Apple Silicon, where ggml_metal_device_free can abort after
-    // otherwise-successful CLI output (#368).
+    // This avoids relying solely on runtime finalizers during CLI shutdown.
     for (const ctx of this.embedContexts) {
       await disposeWithTimeout("embedding context", () => ctx.dispose());
     }
@@ -1976,66 +1942,6 @@ export function canUnloadLLM(): boolean {
 }
 
 // =============================================================================
-// Darwin Metal exit-crash mitigation
-// =============================================================================
-//
-// libggml-metal on macOS keeps allocated model memory wired via "residency
-// sets" with a 180-second keep_alive timer (added in ggml-org/llama.cpp#11427).
-// The process-static `std::vector<std::unique_ptr<ggml_metal_device>>`
-// destructor fires during libc `exit()` → `__cxa_finalize_ranges` and asserts
-// `[rsets->data count] == 0` — but the keep_alive hasn't expired, so the
-// assertion fails and `ggml_abort` dumps a multi-kilobyte stack trace to
-// stderr after the user-visible output. See ggml-org/llama.cpp#22593.
-//
-// No JS-side dispose call (`llama.dispose()`, `model.dispose()`, etc.) can
-// prevent it: the static destructor runs after every JS-reachable cleanup,
-// and `process.reallyExit` on Node calls libc `exit()` not `_exit()` (it
-// does NOT skip C++ static destructors — verified in
-// node/src/api/environment.cc).
-//
-// The actual fix is to disable residency sets via `GGML_METAL_NO_RESIDENCY=1`,
-// which we set from `bin/qmd` before Node loads the native binding. For QMD's
-// short-lived CLI workflow this has no measurable cost (subsequent calls
-// don't reuse the warm mapping). The functions below report whether that
-// mitigation is in effect — kept here, in the module that depends on the
-// underlying resource, so doctor can answer "is the protection active?"
-// without reaching into env handling directly.
-//
-// Setting `QMD_METAL_KEEP_RESIDENCY=1` opts back into residency sets (with
-// the visible-noise consequences). The legacy `QMD_DISABLE_DARWIN_SAFE_EXIT`
-// env var is accepted as a no-op alias for back-compat; it had no effect on
-// Node prior to this fix.
-
-/**
- * Whether QMD's darwin Metal exit-crash mitigation is active in this process:
- *   true  → residency sets disabled, process exit completes silently
- *   false → either non-darwin, or `QMD_METAL_KEEP_RESIDENCY=1` overrode it,
- *           in which case the libggml-metal teardown assertion may fire
- */
-export function isDarwinMetalMitigationActive(): boolean {
-  if (process.platform !== "darwin") return false;
-  if (process.env.QMD_METAL_KEEP_RESIDENCY === "1") return false;
-  return process.env.GGML_METAL_NO_RESIDENCY === "1";
-}
-
-/**
- * Compatibility shim: previous releases installed a `process.on('exit')` hook
- * that tried to skip the C++ static destructor by calling `process.reallyExit`.
- * That mechanism didn't work on Node (Environment::Exit still calls libc
- * `exit()`), so it was replaced by `GGML_METAL_NO_RESIDENCY=1` from bin/qmd.
- * Kept as a no-op for code paths that still call it; safe to remove once no
- * production launcher predates the residency-set fix.
- */
-export function installDarwinExitGuard(): void {
-  // Intentional no-op. See isDarwinMetalMitigationActive() for the real check.
-}
-
-/** @deprecated Replaced by isDarwinMetalMitigationActive. */
-export function isDarwinExitGuardInstalled(): boolean {
-  return isDarwinMetalMitigationActive();
-}
-
-// =============================================================================
 // Singleton for default LlamaCpp instance
 // =============================================================================
 
@@ -2043,8 +1949,7 @@ let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
  * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
- * constructor installs the darwin exit guard, so any code path that obtains
- * the singleton is protected.
+ * instance lazy-loads the node-llama-cpp runtime and models on first use.
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
@@ -2054,13 +1959,9 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 }
 
 /**
- * Set a custom default LlamaCpp instance (useful for testing). Setting a
- * non-null instance also ensures the darwin exit guard is installed — keeps
- * the invariant intact for test doubles that didn't go through the real
- * constructor.
+ * Set a custom default LlamaCpp instance (useful for testing).
  */
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
-  if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
 }
 
