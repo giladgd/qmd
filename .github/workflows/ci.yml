@@ -33,7 +33,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install sqlite
 
-      - run: pnpm ci
+      - run: pnpm install --frozen-lockfile
 
       - name: Tests
         run: npx vitest run --reporter=verbose --testTimeout 60000 test/
