@@ -31,7 +31,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install sqlite
 
-      - run: npm ci
+      - run: pnpm ci
 
       - name: Tests
         run: npx vitest run --reporter=verbose --testTimeout 60000 test/
